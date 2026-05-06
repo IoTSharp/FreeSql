@@ -28,7 +28,7 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="SonnetDB" Version="1.0.0" />
+		<PackageReference Include="SonnetDB" Version="1.1.0" />
 	</ItemGroup>
 
 	<ItemGroup>

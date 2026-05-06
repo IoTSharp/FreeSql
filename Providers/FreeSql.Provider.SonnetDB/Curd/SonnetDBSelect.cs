@@ -1,11 +1,24 @@
+﻿// SonnetDBSelect.cs
+// SonnetDB 的 SELECT 查询 SQL 生成器。
+//
+// SonnetDB 与标准 SQL 的主要差异：
+//   1. 不支持表别名引用 —— "alias.column" 写法无效，必须直接写 "column"。
+//      通过 RemoveTableAliases 在 SQL 输出前统一消除所有别名引用。
+//   2. ORDER BY 须位于 LIMIT / OFFSET 之前（与标准 SQL 相同，但需严格保证）。
+//   3. FreeSql Count() 查询会生成 "1 as1" 占位符，
+//      SonnetDB 不接受裸 1 作为 SELECT 字段，需通过 NormalizeSelectField
+//      将其改写为 "count(1) as1"。
+//   4. 支持多表 UNION ALL 查询，生成逻辑与其他 Provider 保持一致。
+//
+// 所有多表重载（T1~T16）均复用 SonnetDBSelect<T1>.ToSqlStatic，
+// 以保持 SQL 生成逻辑的单一来源。
+
 using FreeSql.Internal;
 using FreeSql.Internal.Model;
-using FreeSql.Provider.SonnetDB.Attributes;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
-using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -15,6 +28,11 @@ namespace FreeSql.SonnetDB.Curd
     class SonnetDBSelect<T1> : FreeSql.Internal.CommonProvider.Select1Provider<T1>
     {
 
+        /// <summary>
+        /// 生成 SonnetDB SELECT 语句的核心静态方法。
+        /// 处理 FROM、JOIN、WHERE、GROUP BY、HAVING、ORDER BY、LIMIT、OFFSET 子句，
+        /// 并在最终 SQL 输出前消除表别名引用（SonnetDB 不支持 alias.column 语法）。
+        /// </summary>
         internal static string ToSqlStatic(CommonUtils _commonUtils, CommonExpression _commonExpression, string _select, bool _distinct, string field, StringBuilder _join, StringBuilder _where, string _groupby, string _having, string _orderby, int _skip, int _limit, List<SelectTableInfo> _tables, List<Dictionary<Type, string>> tbUnions, Func<Type, string, string> _aliasRule, string _tosqlAppendContent, List<GlobalFilter.Item> _whereGlobalFilter, IFreeSql _orm)
         {
             if (_orm.CodeFirst.IsAutoSyncStructure)
@@ -38,6 +56,7 @@ namespace FreeSql.SonnetDB.Curd
                 var sbnav = new StringBuilder();
                 sb.Append(_select);
                 if (_distinct) sb.Append("DISTINCT ");
+                // NormalizeSelectField 负责把 FreeSql 对 Count() 生成的 "1 as1" 改写为 "count(1) as1"。
                 sb.Append(NormalizeSelectField(field, _commonUtils, _tables)).Append(" \r\nFROM ");
                 var tbsjoin = _tables.Where(a => a.Type != SelectTableInfoType.From && a.Type != SelectTableInfoType.Parent && a.Type != SelectTableInfoType.WithoutJoin).ToArray();
                 var tbsfrom = _tables.Where(a => a.Type == SelectTableInfoType.From).ToArray();
@@ -116,6 +135,8 @@ namespace FreeSql.SonnetDB.Curd
                     if (string.IsNullOrEmpty(_having) == false)
                         sb.Append(" \r\nHAVING ").Append(_having.Substring(5));
                 }
+                // ORDER BY 必须在 LIMIT / OFFSET 之前输出（SonnetDB 语法要求）。
+                if (string.IsNullOrEmpty(_orderby) == false) sb.Append(_orderby);
                 if (_limit > 0)
                     sb.Append(" \r\nlimit ").Append(_limit);
                 if (_skip > 0)
@@ -124,9 +145,19 @@ namespace FreeSql.SonnetDB.Curd
                 sbnav.Clear();
                 if (tbUnionsGt0) sb.Append(") ftb");
             }
+            // 最终消除所有表别名引用，确保输出 SQL 符合 SonnetDB 语法（不支持 alias.col）。
             return RemoveTableAliases(sb.Append(_tosqlAppendContent).ToString(), _tables);
         }
 
+        /// <summary>
+        /// 消除 SQL 字符串中所有表别名引用。
+        /// <para>SonnetDB 不支持 <c>alias.column</c> 语法，FreeSql 默认生成的列引用携带表别名，
+        /// 此方法通过正则表达式批量去除：</para>
+        /// <list type="bullet">
+        ///   <item>去除列引用前的 <c>alias.</c> 前缀</item>
+        ///   <item>去除 FROM / JOIN 子句中表名后的别名</item>
+        /// </list>
+        /// </summary>
         static string RemoveTableAliases(string sql, List<SelectTableInfo> tables)
         {
             const string quotedIdentifierPattern = "\"(?:[^\"]|\"\")*\"";
@@ -134,41 +165,28 @@ namespace FreeSql.SonnetDB.Curd
             foreach (var alias in tables.Select(a => a.Alias).Where(a => string.IsNullOrEmpty(a) == false).Distinct().OrderByDescending(a => a.Length))
             {
                 var escapedAlias = Regex.Escape(alias);
+                // 去除列引用中的 "alias." 前缀。
                 sql = Regex.Replace(sql, $@"\b{escapedAlias}\.", "", RegexOptions.IgnoreCase);
+                // 去除 FROM 子句中表名后的别名。
                 sql = Regex.Replace(sql, $@"(\bFROM\s+{tableNamePattern})\s+{escapedAlias}\b", "$1", RegexOptions.IgnoreCase);
+                // 去除 JOIN 子句中表名后的别名。
                 sql = Regex.Replace(sql, $@"(\bJOIN\s+{tableNamePattern})\s+{escapedAlias}\b", "$1", RegexOptions.IgnoreCase);
             }
             return sql;
         }
 
+        /// <summary>
+        /// 规范化 SELECT 字段列表。
+        /// <para>FreeSql 对 <c>.Count()</c> 查询会生成裸 <c>1 as1</c> 作为 SELECT 字段占位符，
+        /// SonnetDB 不接受裸整数作为 SELECT 字段，需将其改写为 <c>count(1) as1</c>。</para>
+        /// <para>SonnetDB 1.1.0+ 原生支持 <c>count(1)</c> 等价于 <c>count(*)</c>。</para>
+        /// </summary>
+        // SonnetDB 1.1.0+ supports count(1) = count(*) natively.
+        // Only rewrite bare "1 as1" (emitted by FreeSql for Count() queries) to "count(1) as1".
         static string NormalizeSelectField(string field, CommonUtils commonUtils, List<SelectTableInfo> tables)
         {
-            var countField = GetCountField(commonUtils, tables) ?? "*";
-            field = Regex.Replace(field, @"\bcount\s*\(\s*1\s*\)", _ => $"count({countField})", RegexOptions.IgnoreCase);
-            field = Regex.Replace(field, @"^\s*1\s+as1\s*$", _ => $"count({countField}) as1", RegexOptions.IgnoreCase);
+            field = Regex.Replace(field, @"^\s*1\s+as1\s*$", "count(1) as1", RegexOptions.IgnoreCase);
             return field;
-        }
-
-        static string GetCountField(CommonUtils commonUtils, List<SelectTableInfo> tables)
-        {
-            var table = tables.FirstOrDefault(a => a.Type == SelectTableInfoType.From)?.Table;
-            var col = table?.ColumnsByPosition.FirstOrDefault(a => IsFieldColumn(table, a));
-            return col == null ? null : commonUtils.QuoteSqlName(col.Attribute.Name);
-        }
-
-        static bool IsFieldColumn(TableInfo tb, ColumnInfo col)
-        {
-            if (string.Equals(col.Attribute.Name, "time", StringComparison.OrdinalIgnoreCase)) return false;
-            var dbType = (col.Attribute.DbType ?? "").Trim();
-            if (dbType.StartsWith("FIELD", StringComparison.OrdinalIgnoreCase)) return true;
-            if (dbType.StartsWith("TAG", StringComparison.OrdinalIgnoreCase)) return false;
-            if (tb.Properties.TryGetValue(col.CsName, out var property))
-            {
-                if (property.GetCustomAttribute<SonnetDBFieldAttribute>() != null) return true;
-                if (property.GetCustomAttribute<SonnetDBTagAttribute>() != null) return false;
-            }
-            var mapType = col.Attribute.MapType.NullableTypeOrThis();
-            return mapType != typeof(string) && mapType != typeof(char) && mapType != typeof(Guid);
         }
 
         public SonnetDBSelect(IFreeSql orm, CommonUtils commonUtils, CommonExpression commonExpression, object dywhere) : base(orm, commonUtils, commonExpression, dywhere) { }
